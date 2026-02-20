@@ -1,70 +1,115 @@
 # ============================================
-# ПОЛНЫЙ ЗАПУСК OUROBOROS С БЕСПЛАТНЫМИ МОДЕЛЯМИ (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# ШАГ 1: ПОЛНЫЙ LLM.PY ДЛЯ GITHUB MODELS
 # ============================================
 
-# 1. УСТАНАВЛИВАЕМ ВСЁ ЧТО НУЖНО
-!pip install -q requests python-telegram-bot python-dotenv
-
-# 2. КЛОНИРУЕМ РЕПОЗИТОРИЙ
-!git clone https://github.com/razzant/ouroboros.git /content/ouroboros_repo
-%cd /content/ouroboros_repo
-
-# 3. ПОЛНОСТЬЮ ЗАМЕНЯЕМ ФАЙЛ LLM.PY НА БЕСПЛАТНУЮ ВЕРСИЮ (С ДОБАВЛЕННЫМИ КОНСТАНТАМИ)
-with open('/content/ouroboros_repo/ouroboros/llm.py', 'w') as f:
-    f.write('''"""
-LLM client for GitHub Models (Mistral, DeepSeek, Phi, Llama).
-Supports multiple free models with fallback.
-For Russia: no credits, no OpenRouter, just a GitHub token.
+%%writefile /content/ouroboros_repo/ouroboros/llm.py
+"""
+LLM client for GitHub Models - FULL COMPATIBLE VERSION
+Preserves all original functionality but uses free GitHub Models
 """
 import os
-import json
 import time
+import json
 import requests
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Tuple
+from collections import defaultdict
 
-# GitHub Models inference endpoint
+# ============================================
+# КОНФИГУРАЦИЯ МОДЕЛЕЙ
+# ============================================
 GITHUB_MODELS_ENDPOINT = "https://models.inference.ai.azure.com"
 
-# Available free models on GitHub
-MODEL_LIST = {
-    "mistralai/Mistral-7B-Instruct-v0.3": "mistral-7b",
-    "mistralai/Mistral-Nemo-Instruct-2407": "mistral-nemo",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": "mixtral",
-    "deepseek-ai/DeepSeek-R1": "deepseek-r1",
-    "deepseek-ai/DeepSeek-V3": "deepseek-v3",
-    "microsoft/Phi-3.5-mini-instruct": "phi-3.5-mini",
-    "microsoft/Phi-3.5-MoE-instruct": "phi-3.5-moe",
-    "microsoft/Phi-3.5-vision-instruct": "phi-3.5-vision",
-    "microsoft/Phi-4": "phi-4",
-    "meta-llama/Llama-3.2-11B-Vision-Instruct": "llama-3.2-11b",
-    "meta-llama/Llama-3.2-90B-Vision-Instruct": "llama-3.2-90b",
-    "meta-llama/Llama-3.3-70B-Instruct": "llama-3.3-70b",
-    "meta-llama/Llama-Guard-3-11B-Vision": "llama-guard",
-    "ai21-ai/Jamba-Instruct": "jamba-instruct",
-    "cohere-ai/Command-R": "command-r",
-    "cohere-ai/Command-R-Plus": "command-r-plus",
-    "nomic-ai/Nomic-Embed-Text-v1.5": "nomic-embed",
+# Все доступные модели (быстрые и умные)
+AVAILABLE_MODELS = {
+    # Самые быстрые (для лёгких задач)
+    "phi-4-mini": "Phi-4-mini-instruct",
+    "gpt-4.1-mini": "gpt-4.1-mini",
+    "llama-3.2-11b": "Llama-3.2-11B-Vision-Instruct",
+    # Умные (для сложных задач и эволюции)
+    "deepseek-r1": "DeepSeek-R1",
+    "deepseek-v3": "DeepSeek-V3",
+    "mistral-nemo": "Mistral-Nemo",
 }
 
-MODEL_NAME_TO_ID = {v: k for k, v in MODEL_LIST.items()}
+# Маппинг коротких имён в полные
+MODEL_NAME_TO_ID = AVAILABLE_MODELS
+MODEL_ID_TO_NAME = {v: k for k, v in AVAILABLE_MODELS.items()}
 
-# Константы, которые нужны для совместимости с оригинальным кодом
-DEFAULT_MODEL = "mistral-nemo"
-DEFAULT_LIGHT_MODEL = "phi-3.5-mini"
-DEFAULT_CODE_MODEL = "deepseek-r1"
+# Модели по умолчанию (как в оригинале)
+DEFAULT_MODEL = "phi-4-mini"              # Для обычных задач
+DEFAULT_LIGHT_MODEL = "phi-4-mini"        # Для фонового сознания
+DEFAULT_CODE_MODEL = "deepseek-r1"        # Для кода (умная)
+DEFAULT_REVIEW_MODEL = "deepseek-r1"      # Для ревью (умная)
 
+# Цены (все бесплатно!)
+MODEL_PRICES = {name: {"prompt": 0.0, "completion": 0.0} for name in AVAILABLE_MODELS}
+
+# Статистика использования
+_usage_stats = defaultdict(lambda: {"prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0})
+_last_request_time = 0
+_min_request_interval = 60  # 1 запрос в минуту на модель
+_request_lock = threading.Lock()
+
+# ============================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (оригинальные)
+# ============================================
+def normalize_reasoning_effort(effort: str) -> float:
+    """Convert reasoning effort to temperature (оригинальная функция)"""
+    mapping = {
+        "low": 0.3,
+        "medium": 0.5,
+        "high": 0.7,
+        "very_low": 0.1,
+        "very_high": 0.9,
+    }
+    return mapping.get(effort.lower(), 0.5)
+
+def count_tokens(text: str, model: Optional[str] = None) -> int:
+    """Approximate token count (оригинальная функция)"""
+    return len(text) // 4
+
+def calculate_cost(usage: Dict[str, int], model: str) -> float:
+    """Calculate cost (always 0 for GitHub Models)"""
+    return 0.0
+
+def add_usage(model: str, prompt_tokens: int, completion_tokens: int):
+    """Add usage statistics (оригинальная функция)"""
+    _usage_stats[model]["prompt_tokens"] += prompt_tokens
+    _usage_stats[model]["completion_tokens"] += completion_tokens
+    _usage_stats[model]["cost_usd"] += 0.0
+
+def get_usage_stats() -> Dict:
+    """Get all usage statistics"""
+    return dict(_usage_stats)
+
+def reset_usage_stats():
+    """Reset usage statistics"""
+    _usage_stats.clear()
+
+# ============================================
+# ОСНОВНОЙ КЛАСС (ПОЛНАЯ ВЕРСИЯ)
+# ============================================
 class LLMClient:
-    """Client for GitHub Models API (free, token-based)"""
+    """Full-featured LLM client compatible with original Ouroboros"""
     
-    def __init__(self, model: str = "mistralai/Mistral-Nemo-Instruct-2407"):
-        if model in MODEL_NAME_TO_ID:
-            self.model = MODEL_NAME_TO_ID[model]
-        elif model in MODEL_LIST:
-            self.model = model
-        else:
-            print(f"⚠️ Unknown model '{model}', defaulting to Mistral Nemo")
-            self.model = "mistralai/Mistral-Nemo-Instruct-2407"
+    def __init__(self, model: str = DEFAULT_MODEL):
+        """Initialize client with model selection logic"""
+        global _last_request_time
         
+        # Определяем модель (как в оригинале)
+        if model in AVAILABLE_MODELS:
+            self.short_name = model
+            self.model_name = AVAILABLE_MODELS[model]
+        elif model in MODEL_ID_TO_NAME:
+            self.model_name = model
+            self.short_name = MODEL_ID_TO_NAME[model]
+        else:
+            # Fallback to default
+            self.short_name = DEFAULT_MODEL
+            self.model_name = AVAILABLE_MODELS[DEFAULT_MODEL]
+            print(f"⚠️ Unknown model '{model}', using {self.short_name}")
+        
+        # Токен и заголовки
         self.token = os.environ.get("GITHUB_TOKEN")
         if not self.token:
             raise ValueError("❌ GITHUB_TOKEN not found in environment")
@@ -74,6 +119,7 @@ class LLMClient:
             "Content-Type": "application/json"
         }
         
+        # Статистика последнего запроса
         self.last_usage = {
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -81,216 +127,218 @@ class LLMClient:
             "cost_usd": 0.0
         }
         
-        print(f"✅ LLM Client initialized with model: {self.model}")
-        print(f"💰 Using GitHub Models - 100% FREE!")
-    
-    def _prepare_messages(self, prompt: Union[str, List[Dict[str, str]]], system: Optional[str] = None):
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        if isinstance(prompt, str):
-            messages.append({"role": "user", "content": prompt})
-        elif isinstance(prompt, list):
-            messages.extend(prompt)
-        else:
-            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
-        return messages
-    
-    def generate(
-        self,
-        prompt: Union[str, List[Dict[str, str]]],
-        system: Optional[str] = None,
-        max_tokens: int = 4000,
-        temperature: float = 0.7,
-        stop: Optional[List[str]] = None,
-        **kwargs
-    ) -> Dict[str, Any]:
-        messages = self._prepare_messages(prompt, system)
+        # Цены для модели
+        self.model_prices = MODEL_PRICES.get(self.short_name, {"prompt": 0.0, "completion": 0.0})
         
-        body = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+        print(f"🧠 LLM Client initialized: {self.short_name} -> {self.model_name}")
+    
+    def default_model(self) -> str:
+        """Return default model name (оригинальный метод)"""
+        return self.short_name
+    
+    def _wait_for_rate_limit(self):
+        """Thread-safe rate limiting"""
+        global _last_request_time
+        with _request_lock:
+            now = time.time()
+            time_since_last = now - _last_request_time
+            if time_since_last < _min_request_interval:
+                wait_time = _min_request_interval - time_since_last
+                print(f"⏳ Rate limit: waiting {wait_time:.0f}s...")
+                time.sleep(wait_time)
+            _last_request_time = time.time()
+    
+    def _prepare_messages(self, messages: List[Dict]) -> List[Dict]:
+        """Prepare messages in correct format"""
+        prepared = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if content:
+                    prepared.append({"role": role, "content": content})
+        return prepared
+    
+    def chat(self, messages: List[Dict], **kwargs) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """
+        Main chat method - exact signature expected by original Ouroboros
+        Returns: (response_message, usage_dict)
+        """
+        self._wait_for_rate_limit()
+        
+        prepared_messages = self._prepare_messages(messages)
+        if not prepared_messages:
+            return {"content": "No messages", "role": "assistant"}, {"prompt_tokens": 0, "completion_tokens": 0}
+        
+        # Формируем запрос (поддерживаем все параметры оригинала)
+        request_body = {
+            "model": self.model_name,
+            "messages": prepared_messages,
+            "temperature": kwargs.get("temperature", 0.7),
+            "max_tokens": kwargs.get("max_tokens", 4000),
             "stream": False
         }
-        if stop:
-            body["stop"] = stop
+        
+        # Добавляем stop sequences если есть
+        if "stop" in kwargs and kwargs["stop"]:
+            request_body["stop"] = kwargs["stop"]
+        
+        # Добавляем top_p если есть
+        if "top_p" in kwargs:
+            request_body["top_p"] = kwargs["top_p"]
         
         url = f"{GITHUB_MODELS_ENDPOINT}/chat/completions"
         
         try:
-            response = requests.post(
-                url,
-                headers=self.headers,
-                json=body,
-                timeout=120
-            )
-            response.raise_for_status()
+            response = requests.post(url, headers=self.headers, json=request_body, timeout=120)
+            
+            if response.status_code == 429:
+                print("⏸️ Rate limit hit, waiting 60s...")
+                time.sleep(60)
+                return self.chat(messages, **kwargs)  # Рекурсивный повтор
+            
+            if response.status_code != 200:
+                print(f"❌ API error {response.status_code}: {response.text[:200]}")
+                return {"content": "", "role": "assistant"}, {"prompt_tokens": 0, "completion_tokens": 0}
+            
             result = response.json()
             
+            if "choices" not in result or not result["choices"]:
+                print("❌ No choices in response")
+                return {"content": "", "role": "assistant"}, {"prompt_tokens": 0, "completion_tokens": 0}
+            
+            # Извлекаем ответ
             content = result["choices"][0]["message"]["content"]
             
+            # Статистика использования
             usage = result.get("usage", {})
             prompt_tokens = usage.get("prompt_tokens", 0)
             completion_tokens = usage.get("completion_tokens", 0)
             
-            self.last_usage = {
+            usage_dict = {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
                 "cost_usd": 0.0
             }
             
-            return {
+            # Обновляем статистику
+            self.last_usage = usage_dict
+            add_usage(self.short_name, prompt_tokens, completion_tokens)
+            
+            print(f"✅ Response: {len(content)} chars, {prompt_tokens}+{completion_tokens} tokens")
+            
+            response_message = {
                 "content": content.strip(),
-                "usage": self.last_usage,
-                "model": self.model,
-                "finish_reason": result["choices"][0].get("finish_reason", "stop")
+                "role": "assistant"
             }
             
-        except requests.exceptions.RequestException as e:
-            error_msg = f"GitHub Models API error: {str(e)}"
-            return {
-                "content": "",
-                "error": error_msg,
-                "usage": self.last_usage,
-                "model": self.model
-            }
+            return response_message, usage_dict
+            
+        except requests.exceptions.Timeout:
+            print("⏰ Request timeout")
+            return {"content": "", "role": "assistant"}, {"prompt_tokens": 0, "completion_tokens": 0}
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            return {"content": "", "role": "assistant"}, {"prompt_tokens": 0, "completion_tokens": 0}
     
-    def count_tokens(self, text: str) -> int:
-        return len(text) // 4
+    def generate(self, prompt: Union[str, List[Dict]], system: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """
+        Generate response - compatibility method
+        """
+        if isinstance(prompt, str):
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": prompt})
+        else:
+            messages = prompt
+        
+        response_msg, usage = self.chat(messages, **kwargs)
+        
+        return {
+            "content": response_msg["content"],
+            "usage": usage,
+            "model": self.short_name,
+            "finish_reason": "stop"
+        }
     
     def get_usage(self) -> Dict[str, Any]:
+        """Return last usage data"""
         return self.last_usage
 
 
+# ============================================
+# MULTI-CLIENT (ДЛЯ FALLBACK)
+# ============================================
 class MultiLLMClient:
-    """Client that tries multiple models in sequence."""
+    """Client that tries multiple models in sequence"""
     
     def __init__(self, models: List[str], fallback_to_any: bool = True):
         self.models = models
         self.fallback_to_any = fallback_to_any
         self.current_client = None
         self.last_error = None
-        
-    def generate(self, *args, **kwargs):
+    
+    def chat(self, messages: List[Dict], **kwargs) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """Try each model in sequence"""
         errors = []
         
+        # Try specified models first
         for model_name in self.models:
             try:
-                print(f"🔄 Trying model: {model_name}")
+                print(f"🔄 Trying {model_name}...")
                 client = LLMClient(model=model_name)
-                result = client.generate(*args, **kwargs)
-                
-                if result.get("content") and not result.get("error"):
+                response, usage = client.chat(messages, **kwargs)
+                if response.get("content"):
                     self.current_client = client
-                    return result
+                    return response, usage
                 else:
-                    error = result.get("error", "Empty response")
-                    errors.append(f"{model_name}: {error}")
-                    
+                    errors.append(f"{model_name}: empty response")
             except Exception as e:
-                errors.append(f"{model_name}: {str(e)}")
+                errors.append(f"{model_name}: {e}")
                 continue
         
+        # If fallback enabled, try any available model
         if self.fallback_to_any:
-            print("⚠️ Specified models failed, trying any available model...")
-            
-            tried_models = set(self.models)
-            for full_model in MODEL_LIST.keys():
-                for short, full in MODEL_NAME_TO_ID.items():
-                    if full == full_model and short not in tried_models:
-                        try:
-                            print(f"🔄 Fallback trying: {short}")
-                            client = LLMClient(model=short)
-                            result = client.generate(*args, **kwargs)
-                            
-                            if result.get("content") and not result.get("error"):
-                                self.current_client = client
-                                return result
-                            else:
-                                error = result.get("error", "Empty response")
-                                errors.append(f"{short}: {error}")
-                        except Exception as e:
-                            errors.append(f"{short}: {str(e)}")
-                        break
+            print("⚠️ Trying any available model...")
+            for model_name in AVAILABLE_MODELS.keys():
+                if model_name not in self.models:
+                    try:
+                        print(f"🔄 Fallback: {model_name}...")
+                        client = LLMClient(model=model_name)
+                        response, usage = client.chat(messages, **kwargs)
+                        if response.get("content"):
+                            self.current_client = client
+                            return response, usage
+                    except:
+                        continue
         
-        error_summary = "\\n".join(errors[-5:])
-        return {
-            "content": "",
-            "error": f"All models failed. Last errors:\\n{error_summary}",
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0},
-            "model": "none"
-        }
+        # All failed
+        error_summary = "\n".join(errors[-3:])
+        return {"content": "", "role": "assistant"}, {"prompt_tokens": 0, "completion_tokens": 0}
 
 
+# ============================================
+# BACKWARD COMPATIBILITY
+# ============================================
 def complete(prompt: str, model: Optional[str] = None, **kwargs) -> str:
-    """Simple completion function for backward compatibility."""
+    """Simple completion function for backward compatibility"""
     if model is None:
-        model = os.environ.get("OUROBOROS_MODEL", "mistral-nemo")
-    
+        model = os.environ.get("OUROBOROS_MODEL", DEFAULT_MODEL)
     client = LLMClient(model=model)
     result = client.generate(prompt, **kwargs)
-    
-    if result.get("error"):
-        print(f"⚠️ Completion error: {result['error']}")
-        return ""
-    
     return result.get("content", "")
-''')
 
-print("✅ Файл llm.py успешно заменён на бесплатную версию (с добавленными константами)!")
 
-# 4. ПОЛУЧАЕМ ТОКЕНЫ ИЗ СЕКРЕТОВ COLAB
-from google.colab import userdata
-import os
-
-try:
-    # Забираем токены из секретов Colab
-    GITHUB_TOKEN = userdata.get('GITHUB_TOKEN')
-    TELEGRAM_BOT_TOKEN = userdata.get('TELEGRAM_BOT_TOKEN')
-    
-    if not GITHUB_TOKEN or not TELEGRAM_BOT_TOKEN:
-        raise ValueError("❌ Не найдены токены в секретах Colab!")
-    
-    # Устанавливаем переменные окружения
-    os.environ["GITHUB_TOKEN"] = GITHUB_TOKEN
-    os.environ["TELEGRAM_BOT_TOKEN"] = TELEGRAM_BOT_TOKEN
-    
-    print("✅ Токены успешно загружены из секретов Colab")
-    
-except Exception as e:
-    print(f"❌ Ошибка получения токенов: {e}")
-    print("\n👉 ИНСТРУКЦИЯ:")
-    print("1. Нажми на значок 🔑 (Secrets) в левой панели Colab")
-    print("2. Добавь два секрета:")
-    print("   - Имя: GITHUB_TOKEN    Значение: твой GitHub токен")
-    print("   - Имя: TELEGRAM_BOT_TOKEN    Значение: токен твоего бота")
-    print("3. Для обоих включи 'Notebook access'")
-    print("4. Перезапусти эту ячейку")
-    raise
-
-# 5. ТВОИ НАСТРОЙКИ (ЗАМЕНИ ЭТО!)
-GITHUB_USERNAME = "sundishlytrey"  # <--- ВСТАВЬ СВОЁ ИМЯ С ГИТХАБА
-
-# 6. НАСТРОЙКИ МОДЕЛЕЙ (ВСЁ БЕСПЛАТНО!)
-os.environ["OUROBOROS_MODEL"] = "mistral-nemo"        # Основная модель
-os.environ["OUROBOROS_MODEL_CODE"] = "deepseek-r1"    # Для кода
-os.environ["OUROBOROS_MODEL_LIGHT"] = "phi-3.5-mini"  # Для фона
-os.environ["OUROBOROS_MODEL_FALLBACK_LIST"] = "mistral-nemo,deepseek-r1,phi-3.5-mini,llama-3.2-11b"
-
-# Бюджет (просто заглушка, деньги не тратятся)
-os.environ["TOTAL_BUDGET"] = "100"
-
-print("\n🚀 ВСЁ ГОТОВО! Запускаем агента...\n")
-
-# 7. СОЗДАЁМ ФАЙЛ С КОНФИГУРАЦИЕЙ ДЛЯ ЗАПУСКА
-with open('/content/ouroboros_repo/run_config.py', 'w') as f:
-    f.write(f'''
-import os
-os.environ["GITHUB_USER"] = "sundishlytrey"
-os.environ["GITHUB_REPO"] = "ouro_test"
-''')
-
-# 8. ЗАПУСКАЕМ АГЕНТА (обновлённая команда)
-!cd /content/ouroboros_repo && python colab_launcher.py --github_user={GITHUB_USERNAME}
+# ============================================
+# TESTING
+# ============================================
+if __name__ == "__main__":
+    print("\n🔍 Testing LLM Client...")
+    client = LLMClient("phi-4-mini")
+    response, usage = client.chat([
+        {"role": "user", "content": "Say hello in Russian"}
+    ])
+    print(f"Response: {response['content'][:100]}...")
+    print(f"Usage: {usage}")
