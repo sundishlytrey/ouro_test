@@ -1,310 +1,320 @@
 # ouroboros/llm.py
-# Полная замена: вместо OpenRouter используем бесплатный Google Gemini API
-
+"""
+LLM client for GitHub Models (Mistral, DeepSeek, Phi, Llama).
+Supports multiple free models with fallback.
+For Russia: no credits, no OpenRouter, just a GitHub token.
+"""
 import os
 import json
 import time
-import asyncio
-import aiohttp
-import tiktoken
-from typing import Optional, Dict, Any, List, AsyncGenerator, Tuple
-from dataclasses import dataclass, field
+import requests
+from typing import Optional, Dict, Any, List, Union
 
-# Импорты из проекта
-from .utils import get_logger, truncate_text
-from .exceptions import LLMError, BudgetExceededError, LLMResponseError
+# GitHub Models inference endpoint
+GITHUB_MODELS_ENDPOINT = "https://models.inference.ai.azure.com"
 
-logger = get_logger(__name__)
-
-# Конфигурация по умолчанию для бесплатной модели
-DEFAULT_MODEL = "gemini-2.0-flash-exp"  # Быстрая и бесплатная модель
-DEFAULT_MAX_TOKENS = 8192  # Стандартный лимит для вывода
-DEFAULT_TEMPERATURE = 0.7
-
-# Цены (условные, чтобы не ломалась система бюджета, т.к. Gemini бесплатный)
-# Ставим минимальную цену, чтобы бюджет не утекал, но система работала.
-GEMINI_PRICING = {
-    "gemini-2.0-flash-exp": {"prompt": 0.0000001, "completion": 0.0000001},  # Цена за токен в USD
-    "gemini-1.5-flash": {"prompt": 0.0000001, "completion": 0.0000001},
-    "gemini-1.5-pro": {"prompt": 0.0000001, "completion": 0.0000001},
+# Available free models on GitHub (as of 2025)
+# See: https://github.com/marketplace?type=models
+MODEL_LIST = {
+    # Mistral family
+    "mistralai/Mistral-7B-Instruct-v0.3": "mistral-7b",
+    "mistralai/Mistral-Nemo-Instruct-2407": "mistral-nemo",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": "mixtral",
+    # DeepSeek
+    "deepseek-ai/DeepSeek-R1": "deepseek-r1",
+    "deepseek-ai/DeepSeek-V3": "deepseek-v3",
+    # Microsoft Phi
+    "microsoft/Phi-3.5-mini-instruct": "phi-3.5-mini",
+    "microsoft/Phi-3.5-MoE-instruct": "phi-3.5-moe",
+    "microsoft/Phi-3.5-vision-instruct": "phi-3.5-vision",
+    "microsoft/Phi-4": "phi-4",
+    # Meta Llama
+    "meta-llama/Llama-3.2-11B-Vision-Instruct": "llama-3.2-11b",
+    "meta-llama/Llama-3.2-90B-Vision-Instruct": "llama-3.2-90b",
+    "meta-llama/Llama-3.3-70B-Instruct": "llama-3.3-70b",
+    "meta-llama/Llama-Guard-3-11B-Vision": "llama-guard",
+    # AI21
+    "ai21-ai/Jamba-Instruct": "jamba-instruct",
+    # Cohere
+    "cohere-ai/Command-R": "command-r",
+    "cohere-ai/Command-R-Plus": "command-r-plus",
+    # Others
+    "nomic-ai/Nomic-Embed-Text-v1.5": "nomic-embed",
 }
 
-@dataclass
-class LLMUsage:
-    """Следит за использованием токенов и стоимостью (для совместимости с системой бюджета)."""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    cost: float = 0.0
-    model: str = DEFAULT_MODEL
+# Reverse mapping for model names
+MODEL_NAME_TO_ID = {v: k for k, v in MODEL_LIST.items()}
 
-    def add(self, other: 'LLMUsage'):
-        self.prompt_tokens += other.prompt_tokens
-        self.completion_tokens += other.completion_tokens
-        self.total_tokens += other.total_tokens
-        self.cost += other.cost
-
-class OpenRouterClient:
-    """
-    Полностью переписанный клиент.
-    Теперь он работает с бесплатным Google Gemini API через Google AI Studio.
-    Название класса оставлено для совместимости, чтобы не менять другие файлы.
-    """
-
-    def __init__(
+class LLMClient:
+    """Client for GitHub Models API (free, token-based)"""
+    
+    def __init__(self, model: str = "mistralai/Mistral-Nemo-Instruct-2407"):
+        """
+        Initialize the client.
+        
+        Args:
+            model: Model identifier (can be full path or short name like 'mistral-nemo')
+        """
+        # Check if it's a short name, convert to full path
+        if model in MODEL_NAME_TO_ID:
+            self.model = MODEL_NAME_TO_ID[model]
+        elif model in MODEL_LIST:
+            self.model = model
+        else:
+            # Default to Mistral Nemo if unknown
+            print(f"⚠️ Unknown model '{model}', defaulting to Mistral Nemo")
+            self.model = "mistralai/Mistral-Nemo-Instruct-2407"
+        
+        # Get token from environment
+        self.token = os.environ.get("GITHUB_TOKEN")
+        if not self.token:
+            raise ValueError("❌ GITHUB_TOKEN not found in environment. "
+                           "Please add your GitHub token to Colab secrets or environment.")
+        
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Pricing is FREE, but we keep budget tracking for compatibility
+        self.last_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0  # Always zero - free!
+        }
+        
+        print(f"✅ LLM Client initialized with model: {self.model}")
+        print(f"💰 Using GitHub Models - 100% FREE for Russia!")
+    
+    def _prepare_messages(self, prompt: Union[str, List[Dict[str, str]]], system: Optional[str] = None):
+        """Convert various prompt formats to chat messages format."""
+        messages = []
+        
+        # Add system message if provided
+        if system:
+            messages.append({"role": "system", "content": system})
+        
+        # Handle different prompt types
+        if isinstance(prompt, str):
+            messages.append({"role": "user", "content": prompt})
+        elif isinstance(prompt, list):
+            # Assume it's already in message format
+            messages.extend(prompt)
+        else:
+            raise ValueError(f"Unsupported prompt type: {type(prompt)}")
+        
+        return messages
+    
+    def generate(
         self,
-        api_key: Optional[str] = None,
-        model: str = DEFAULT_MODEL,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        temperature: float = DEFAULT_TEMPERATURE,
-        budget_usd: Optional[float] = None,
-    ):
-        """
-        Инициализация клиента для Gemini API.
-
-        Аргументы:
-            api_key: API-ключ Google AI Studio. Если None, берется из переменной окружения GOOGLE_API_KEY.
-            model: Название модели Gemini (например, "gemini-2.0-flash-exp", "gemini-1.5-flash").
-            max_tokens: Максимальное количество токенов в ответе.
-            temperature: Температура (креативность) модели.
-            budget_usd: Лимит бюджета (для совместимости, но Gemini бесплатный).
-        """
-        # Приоритет: аргумент -> переменная окружения -> ошибка
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        if not self.api_key:
-            # Если нет ключа Gemini, пробуем старый ключ OpenRouter (на всякий случай)
-            self.api_key = os.getenv("OPENROUTER_API_KEY")
-            if self.api_key:
-                logger.warning("GOOGLE_API_KEY not found, but OPENROUTER_API_KEY is set. Please set GOOGLE_API_KEY for free Gemini access.")
-                # Мы всё равно не будем использовать OpenRouter, но предупредим пользователя.
-            else:
-                raise ValueError("GOOGLE_API_KEY environment variable not set. Get a free key from Google AI Studio.")
-
-        self.model = model
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.budget_usd = budget_usd
-        self.total_usage = LLMUsage()
-
-        # Базовый URL для Gemini API
-        self.base_url = "https://generativelanguage.googleapis.com/v1beta"
-        logger.info(f"Initialized Gemini client with model: {self.model}")
-
-    def _count_tokens(self, text: str, model: Optional[str] = None) -> int:
-        """
-        Подсчет токенов с помощью tiktoken (приблизительно).
-        """
-        try:
-            # Используем кодировку cl100k_base (для GPT-4, работает как приближение)
-            enc = tiktoken.get_encoding("cl100k_base")
-            return len(enc.encode(text))
-        except Exception as e:
-            logger.warning(f"Token counting failed: {e}. Approximating by chars.")
-            # Грубое приближение: 1 токен ≈ 4 символа
-            return len(text) // 4
-
-    async def _make_gemini_request(
-        self,
-        messages: List[Dict[str, str]],
-        stream: bool = False,
-        tools: Optional[List[Dict]] = None,
+        prompt: Union[str, List[Dict[str, str]]],
+        system: Optional[str] = None,
+        max_tokens: int = 4000,
+        temperature: float = 0.7,
+        stop: Optional[List[str]] = None,
+        **kwargs
     ) -> Dict[str, Any]:
         """
-        Внутренний метод для отправки запроса к Gemini API.
-        Преобразует сообщения из формата OpenAI/OpenRouter в формат Gemini.
+        Generate a response from the model.
+        
+        Args:
+            prompt: User prompt (string or message list)
+            system: Optional system message
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            stop: Optional stop sequences
+            **kwargs: Additional parameters (ignored for GitHub API)
+            
+        Returns:
+            Dictionary with 'content', 'usage', and other metadata
         """
-        # --- 1. Преобразование сообщений в формат Gemini ---
-        # Gemini ожидает список частей (parts) с текстом.
-        # Системное сообщение передается отдельно.
-        system_instruction = None
-        gemini_contents = []
-
-        for msg in messages:
-            role = msg["role"]
-            content = msg.get("content", "")
-
-            if role == "system":
-                system_instruction = content
-            elif role == "user":
-                gemini_contents.append({
-                    "role": "user",
-                    "parts": [{"text": content}]
-                })
-            elif role == "assistant":
-                gemini_contents.append({
-                    "role": "model",  # В Gemini роль ассистента называется "model"
-                    "parts": [{"text": content}]
-                })
-            # Роль "tool" пока игнорируем для простоты (в базовой версии агента она не используется)
-
-        # --- 2. Формирование тела запроса ---
-        request_body: Dict[str, Any] = {
-            "contents": gemini_contents,
-            "generationConfig": {
-                "maxOutputTokens": self.max_tokens,
-                "temperature": self.temperature,
+        messages = self._prepare_messages(prompt, system)
+        
+        # Prepare request body
+        body = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False
+        }
+        
+        if stop:
+            body["stop"] = stop
+        
+        # Make the API call
+        url = f"{GITHUB_MODELS_ENDPOINT}/chat/completions"
+        
+        try:
+            response = requests.post(
+                url,
+                headers=self.headers,
+                json=body,
+                timeout=120
+            )
+            response.raise_for_status()
+            result = response.json()
+            
+            # Extract content
+            content = result["choices"][0]["message"]["content"]
+            
+            # Update usage tracking (GitHub provides token counts)
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            
+            self.last_usage = {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "cost_usd": 0.0  # Always free!
             }
+            
+            return {
+                "content": content.strip(),
+                "usage": self.last_usage,
+                "model": self.model,
+                "finish_reason": result["choices"][0].get("finish_reason", "stop")
+            }
+            
+        except requests.exceptions.RequestException as e:
+            error_msg = f"GitHub Models API error: {str(e)}"
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_detail = e.response.json()
+                    error_msg += f" - {json.dumps(error_detail)}"
+                except:
+                    error_msg += f" - {e.response.text[:200]}"
+            
+            print(f"❌ {error_msg}")
+            
+            # Return error response
+            return {
+                "content": "",
+                "error": error_msg,
+                "usage": self.last_usage,
+                "model": self.model
+            }
+    
+    def count_tokens(self, text: str) -> int:
+        """
+        Rough token estimation (GitHub doesn't provide this endpoint).
+        Using approximate 4 chars per token.
+        """
+        return len(text) // 4
+    
+    def get_usage(self) -> Dict[str, Any]:
+        """Return last usage data."""
+        return self.last_usage
+
+
+# Optional: Wrapper for multiple models with fallback
+class MultiLLMClient:
+    """
+    Client that tries multiple models in sequence.
+    Useful for fallback when one model is rate-limited.
+    """
+    
+    def __init__(self, models: List[str], fallback_to_any: bool = True):
+        """
+        Args:
+            models: List of model names (can be short or full)
+            fallback_to_any: If True, try any available model on failure
+        """
+        self.models = models
+        self.fallback_to_any = fallback_to_any
+        self.current_client = None
+        self.last_error = None
+        
+    def generate(self, *args, **kwargs):
+        """Try each model in sequence until one works."""
+        
+        errors = []
+        
+        # Try specified models in order
+        for model_name in self.models:
+            try:
+                print(f"🔄 Trying model: {model_name}")
+                client = LLMClient(model=model_name)
+                result = client.generate(*args, **kwargs)
+                
+                # Check if successful (has content and no error)
+                if result.get("content") and not result.get("error"):
+                    self.current_client = client
+                    return result
+                else:
+                    error = result.get("error", "Empty response")
+                    errors.append(f"{model_name}: {error}")
+                    
+            except Exception as e:
+                errors.append(f"{model_name}: {str(e)}")
+                continue
+        
+        # If we have fallback enabled, try ANY available model
+        if self.fallback_to_any:
+            print("⚠️ Specified models failed, trying any available model...")
+            
+            # Try all models in MODEL_LIST (excluding ones we already tried)
+            tried_models = set(self.models)
+            for full_model in MODEL_LIST.keys():
+                # Extract short name if needed
+                for short, full in MODEL_NAME_TO_ID.items():
+                    if full == full_model and short not in tried_models:
+                        try:
+                            print(f"🔄 Fallback trying: {short}")
+                            client = LLMClient(model=short)
+                            result = client.generate(*args, **kwargs)
+                            
+                            if result.get("content") and not result.get("error"):
+                                self.current_client = client
+                                return result
+                            else:
+                                error = result.get("error", "Empty response")
+                                errors.append(f"{short}: {error}")
+                        except Exception as e:
+                            errors.append(f"{short}: {str(e)}")
+                        break
+        
+        # All models failed
+        error_summary = "\n".join(errors[-5:])  # Show last 5 errors
+        return {
+            "content": "",
+            "error": f"All models failed. Last errors:\n{error_summary}",
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost_usd": 0.0},
+            "model": "none"
         }
 
-        if system_instruction:
-            request_body["system_instruction"] = {
-                "parts": [{"text": system_instruction}]
-            }
 
-        # --- 3. URL для API вызова (с потоком или без) ---
-        url = f"{self.base_url}/models/{self.model}:generateContent"
-        if stream:
-            url = f"{self.base_url}/models/{self.model}:streamGenerateContent"
+# Backward compatibility function for existing code
+def complete(prompt: str, model: Optional[str] = None, **kwargs) -> str:
+    """
+    Simple completion function for backward compatibility.
+    """
+    if model is None:
+        model = os.environ.get("OUROBOROS_MODEL", "mistral-nemo")
+    
+    client = LLMClient(model=model)
+    result = client.generate(prompt, **kwargs)
+    
+    if result.get("error"):
+        print(f"⚠️ Completion error: {result['error']}")
+        return ""
+    
+    return result.get("content", "")
 
-        params = {"key": self.api_key}
-        headers = {"Content-Type": "application/json"}
 
-        # --- 4. Логирование (уровень DEBUG) ---
-        logger.debug(f"Gemini request to {url}")
-        logger.debug(f"Request body (truncated): {truncate_text(json.dumps(request_body), 500)}")
-
-        # --- 5. Отправка запроса ---
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(url, params=params, headers=headers, json=request_body) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(f"Gemini API error {resp.status}: {error_text}")
-                        raise LLMResponseError(f"Gemini API error: {resp.status} - {error_text}")
-
-                    # Обработка потокового ответа (упрощенно)
-                    if stream:
-                        # Для простоты пока не реализуем полноценный стриминг,
-                        # просто вернем первый чанк как полный ответ.
-                        # В будущем можно добавить, но для работы агента это не критично.
-                        response_data = await resp.json()
-                        # В стриминге ответ может быть массивом чанков
-                        if isinstance(response_data, list):
-                            full_response = {"candidates": [{"content": {"parts": []}}]}
-                            for chunk in response_data:
-                                if "candidates" in chunk:
-                                    for cand in chunk["candidates"]:
-                                        if "content" in cand and "parts" in cand["content"]:
-                                            full_response["candidates"][0]["content"]["parts"].extend(cand["content"]["parts"])
-                            response_data = full_response
-                    else:
-                        response_data = await resp.json()
-
-                    logger.debug(f"Gemini response (truncated): {truncate_text(json.dumps(response_data), 500)}")
-                    return response_data
-
-            except aiohttp.ClientError as e:
-                logger.error(f"Network error during Gemini API call: {e}")
-                raise LLMError(f"Network error: {e}") from e
-
-    def _parse_gemini_response(self, response_data: Dict[str, Any]) -> Tuple[str, LLMUsage]:
-        """
-        Разбор ответа от Gemini и извлечение текста + подсчет использования.
-        """
-        try:
-            # Извлекаем текст ответа
-            text = ""
-            if "candidates" in response_data and len(response_data["candidates"]) > 0:
-                candidate = response_data["candidates"][0]
-                if "content" in candidate and "parts" in candidate["content"]:
-                    for part in candidate["content"]["parts"]:
-                        if "text" in part:
-                            text += part["text"]
-
-            if not text:
-                # Если ответ пустой или заблокирован
-                block_reason = response_data.get("promptFeedback", {}).get("blockReason", "Unknown")
-                logger.warning(f"Empty or blocked Gemini response. Block reason: {block_reason}")
-                # Возвращаем пустую строку, как это делает OpenRouter при ошибке
-                text = ""
-
-            # --- Подсчет токенов и стоимости (для системы бюджета) ---
-            prompt_tokens = 0
-            completion_tokens = 0
-
-            # Пробуем получить точные цифры из ответа (если есть)
-            if "usageMetadata" in response_data:
-                usage = response_data["usageMetadata"]
-                prompt_tokens = usage.get("promptTokenCount", 0)
-                completion_tokens = usage.get("candidatesTokenCount", 0)
-            else:
-                # Если нет, считаем приблизительно
-                # Нам нужно знать, какой был промпт. У нас его нет в этом методе.
-                # Оставим 0, система бюджета не сломается.
-                logger.debug("No usage metadata in Gemini response, using 0 for token counts.")
-
-            total_tokens = prompt_tokens + completion_tokens
-
-            # Расчет стоимости по нашим условным ценам
-            pricing = GEMINI_PRICING.get(self.model, {"prompt": 0.0, "completion": 0.0})
-            cost = (prompt_tokens * pricing["prompt"] + completion_tokens * pricing["completion"])
-
-            usage = LLMUsage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                cost=cost,
-                model=self.model,
-            )
-
-            return text, usage
-
-        except Exception as e:
-            logger.error(f"Failed to parse Gemini response: {e}", exc_info=True)
-            raise LLMResponseError(f"Response parsing failed: {e}") from e
-
-    async def completion(
-        self,
-        messages: List[Dict[str, str]],
-        model: Optional[str] = None,
-        max_tokens: Optional[int] = None,
-        temperature: Optional[float] = None,
-        stream: bool = False,
-        tools: Optional[List[Dict]] = None,
-    ) -> Tuple[str, LLMUsage]:
-        """
-        Основной метод для получения ответа от модели.
-        Полностью заменяет старый метод OpenRouter.
-        """
-        # Используем параметры экземпляра или переопределенные
-        model = model or self.model
-        max_tokens = max_tokens or self.max_tokens
-        temperature = temperature or self.temperature
-
-        # Проверка бюджета (если задан)
-        if self.budget_usd is not None and self.total_usage.cost >= self.budget_usd:
-            logger.error(f"Budget exceeded: {self.total_usage.cost:.6f} >= {self.budget_usd}")
-            raise BudgetExceededError(f"Budget exceeded: {self.total_usage.cost:.6f} >= {self.budget_usd}")
-
-        # Сохраняем текущую модель, чтобы потом вернуть, если меняли
-        original_model = self.model
-        self.model = model
-
-        try:
-            # Делаем запрос к Gemini
-            response_data = await self._make_gemini_request(messages, stream=stream, tools=tools)
-
-            # Парсим ответ
-            text, usage = self._parse_gemini_response(response_data)
-
-            # Обновляем общее использование
-            self.total_usage.add(usage)
-
-            # Логируем использование
-            logger.debug(f"LLM call to {model}: {usage.prompt_tokens} prompt + {usage.completion_tokens} completion = {usage.total_tokens} tokens, cost ${usage.cost:.6f}")
-
-            return text, usage
-
-        except Exception as e:
-            logger.error(f"LLM completion failed: {e}", exc_info=True)
-            # Пробрасываем исключение дальше
-            if isinstance(e, (LLMError, BudgetExceededError)):
-                raise
-            raise LLMError(f"LLM completion failed: {e}") from e
-        finally:
-            # Восстанавливаем модель
-            self.model = original_model
-
-    async def close(self):
-        """Закрытие клиента (ничего не делаем, но метод нужен для совместимости)."""
-        pass
+# For direct testing
+if __name__ == "__main__":
+    # Test the client
+    print("Testing LLM client with GitHub Models...")
+    
+    # Test with Mistral Nemo
+    client = LLMClient("mistral-nemo")
+    response = client.generate("Say hello in Russian")
+    print(f"Response: {response.get('content')}")
+    print(f"Usage: {client.get_usage()}")
+    
+    # Test fallback
+    multi = MultiLLMClient(["mistral-7b", "phi-3.5-mini"])
+    response = multi.generate("What is 2+2?")
+    print(f"\nMulti response: {response.get('content')}")
